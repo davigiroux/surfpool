@@ -2814,7 +2814,7 @@ mod tests {
 
     use base64::{Engine, prelude::BASE64_STANDARD};
     use bincode::Options;
-    use crossbeam_channel::Receiver;
+    use crossbeam_channel::{Receiver, Sender};
     use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding};
     use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
     use solana_commitment_config::CommitmentConfig;
@@ -2843,16 +2843,78 @@ mod tests {
         UiRawMessage, UiTransaction, UiTransactionEncoding,
     };
     use solana_transaction_status_client_types::UiTransactionConfig;
-    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
+    use surfpool_types::{
+        BlockProductionMode, ClockCommand, ClockEvent, SimnetCommand, SimnetConfig,
+        TransactionConfirmationStatus,
+    };
     use test_case::test_case;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{
+        runloops::start_block_production_runloop,
         surfnet::{BlockHeader, BlockIdentifier, remote::SurfnetRemoteClient},
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
+
+    fn new_airdrop_runloop(
+        block_production_mode: BlockProductionMode,
+    ) -> (
+        TestSetup<SurfpoolFullRpc>,
+        Sender<ClockEvent>,
+        JoinHandle<std::result::Result<(), String>>,
+    ) {
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, commands_tx.clone());
+        let svm_locker = setup.context.svm_locker.clone();
+        let (clock_events_tx, clock_events_rx) = crossbeam_channel::unbounded();
+        let (clock_commands_tx, _clock_commands_rx) =
+            crossbeam_channel::unbounded::<ClockCommand>();
+        let simnet_config = SimnetConfig::default();
+        let runloop = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("airdrop runloop test runtime should start")
+                .block_on(async {
+                    start_block_production_runloop(
+                        clock_events_rx,
+                        clock_commands_tx,
+                        commands_rx,
+                        commands_tx,
+                        svm_locker,
+                        block_production_mode,
+                        &None,
+                        None,
+                        &simnet_config,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                })
+        });
+
+        (setup, clock_events_tx, runloop)
+    }
+
+    fn stop_airdrop_runloop(
+        setup: &TestSetup<SurfpoolFullRpc>,
+        clock_events_tx: Sender<ClockEvent>,
+        runloop: JoinHandle<std::result::Result<(), String>>,
+    ) {
+        setup
+            .context
+            .simnet_commands_tx
+            .send(SimnetCommand::Terminate(None))
+            .expect("runloop should accept termination");
+        drop(clock_events_tx);
+        runloop
+            .join()
+            .expect("runloop thread should not panic")
+            .expect("runloop should stop cleanly");
+    }
 
     fn build_v1_transaction(
         payer: &Pubkey,
@@ -3539,6 +3601,107 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "transaction is not found in the history"
+        );
+    }
+
+    #[test]
+    fn request_airdrop_produces_blocks_only_in_transaction_mode() {
+        let (transaction_setup, transaction_clock_tx, transaction_runloop) =
+            new_airdrop_runloop(BlockProductionMode::Transaction);
+        let transaction_start_slot = transaction_setup
+            .context
+            .svm_locker
+            .0
+            .blocking_read()
+            .latest_epoch_info
+            .absolute_slot;
+        transaction_setup
+            .rpc
+            .request_airdrop(
+                Some(transaction_setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+            .expect("successful requestAirdrop should succeed");
+        stop_airdrop_runloop(
+            &transaction_setup,
+            transaction_clock_tx,
+            transaction_runloop,
+        );
+        assert_eq!(
+            transaction_setup
+                .context
+                .svm_locker
+                .0
+                .blocking_read()
+                .latest_epoch_info
+                .absolute_slot,
+            transaction_start_slot + 1,
+            "a successful airdrop should confirm a block in transaction mode"
+        );
+
+        let (rejected_setup, rejected_clock_tx, rejected_runloop) =
+            new_airdrop_runloop(BlockProductionMode::Transaction);
+        let rejected_start_slot = rejected_setup
+            .context
+            .svm_locker
+            .0
+            .blocking_read()
+            .latest_epoch_info
+            .absolute_slot;
+        let rejected = rejected_setup
+            .rpc
+            .request_airdrop(
+                Some(rejected_setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                0,
+                None,
+            )
+            .expect_err("rejected requestAirdrop should return an RPC error");
+        assert_eq!(rejected.code, jsonrpc_core::ErrorCode::InvalidParams);
+        stop_airdrop_runloop(&rejected_setup, rejected_clock_tx, rejected_runloop);
+        assert_eq!(
+            rejected_setup
+                .context
+                .svm_locker
+                .0
+                .blocking_read()
+                .latest_epoch_info
+                .absolute_slot,
+            rejected_start_slot,
+            "a rejected airdrop should not confirm a block"
+        );
+
+        let (manual_setup, manual_clock_tx, manual_runloop) =
+            new_airdrop_runloop(BlockProductionMode::Manual);
+        let manual_start_slot = manual_setup
+            .context
+            .svm_locker
+            .0
+            .blocking_read()
+            .latest_epoch_info
+            .absolute_slot;
+        manual_setup
+            .rpc
+            .request_airdrop(
+                Some(manual_setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+            .expect("successful manual-mode requestAirdrop should succeed");
+        stop_airdrop_runloop(&manual_setup, manual_clock_tx, manual_runloop);
+        assert_eq!(
+            manual_setup
+                .context
+                .svm_locker
+                .0
+                .blocking_read()
+                .latest_epoch_info
+                .absolute_slot,
+            manual_start_slot,
+            "a successful airdrop should not confirm a block in manual mode"
         );
     }
 
