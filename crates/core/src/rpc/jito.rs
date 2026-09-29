@@ -1239,9 +1239,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        rpc::full::{Full, SurfpoolFullRpc},
-        runloops::start_block_production_runloop,
-        tests::helpers::TestSetup,
+        rpc::full::Full, runloops::start_block_production_runloop, tests::helpers::TestSetup,
     };
 
     const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
