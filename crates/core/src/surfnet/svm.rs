@@ -501,6 +501,10 @@ pub struct SurfnetSvm {
     /// For example, when an account is updated in the same slot multiple times,
     /// the update with higher write_version should supersede the one with lower write_version.
     pub write_version: u64,
+    /// Monotonic counter bumped by `SurfnetSvmLocker` on every exclusive write access.
+    /// Bundle sandboxes record it at clone time so a commit can detect live-state
+    /// mutations (cheatcodes, account writes) that happened during sandbox execution.
+    pub state_revision: u64,
     pub registered_idls: Box<dyn Storage<String, Vec<VersionedIdl>>>,
     pub feature_set: FeatureSet,
     pub instruction_profiling_enabled: bool,
@@ -590,6 +594,8 @@ pub struct BundleSandbox {
     pub geyser_rx: Receiver<GeyserEvent>,
     pub simnet_rx: Receiver<SimnetEvent>,
     pub confirmation_queue_base_len: usize,
+    /// Live `state_revision` at the moment the sandbox was cloned.
+    pub base_state_revision: u64,
 }
 
 /// Generic helper: drain the overlay state of `sandbox_storage` (which must be an
@@ -794,6 +800,7 @@ impl SurfnetSvm {
             cached_genesis_hash: self.cached_genesis_hash,
             inflation: self.inflation,
             write_version: self.write_version,
+            state_revision: self.state_revision,
             feature_set: self.feature_set.clone(),
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
@@ -860,7 +867,18 @@ impl SurfnetSvm {
             geyser_rx,
             simnet_rx,
             confirmation_queue_base_len,
+            base_state_revision: self.state_revision,
         }
+    }
+
+    /// Records an exclusive write access. Called by `SurfnetSvmLocker` for every writer.
+    pub(crate) fn bump_state_revision(&mut self) {
+        self.state_revision = self.state_revision.wrapping_add(1);
+    }
+
+    /// Whether live state has been mutated since `sandbox` was cloned from `self`.
+    pub fn is_stale_bundle_sandbox(&self, sandbox: &BundleSandbox) -> bool {
+        self.state_revision != sandbox.base_state_revision
     }
 
     /// Atomically commit the outcome of a fully-successful bundle sandbox onto `self`.
@@ -900,21 +918,20 @@ impl SurfnetSvm {
         sandbox: BundleSandbox,
         bundle_status_tx: Sender<TransactionStatusEvent>,
     ) -> SurfpoolResult<Vec<Signature>> {
+        if self.is_stale_bundle_sandbox(&sandbox) {
+            return Err(SurfpoolError::bundle_sandbox_stale(
+                sandbox.base_state_revision,
+                self.state_revision,
+            ));
+        }
+
         let BundleSandbox {
             mut svm,
             geyser_rx,
             simnet_rx,
             confirmation_queue_base_len,
+            base_state_revision: _,
         } = sandbox;
-
-        let sandbox_slot = svm.get_latest_absolute_slot();
-        let live_slot = self.get_latest_absolute_slot();
-        if sandbox_slot != live_slot {
-            return Err(SurfpoolError::bundle_sandbox_slot_mismatch(
-                sandbox_slot,
-                live_slot,
-            ));
-        }
 
         // 1. Drain all overlay storages onto self's real storages.
         commit_overlay_storage(svm.blocks.as_ref(), self.blocks.as_mut())?;
@@ -1264,6 +1281,7 @@ impl SurfnetSvm {
             cached_genesis_hash: None,
             inflation: Inflation::default(),
             write_version: 0,
+            state_revision: 0,
             registered_idls: registered_idls_db,
             feature_set,
             instruction_profiling_enabled: config.instruction_profiling_enabled,
@@ -4610,7 +4628,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::storage::tests::TestType;
+    use crate::{storage::tests::TestType, surfnet::locker::SurfnetSvmLocker};
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
@@ -4686,25 +4704,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bundle_commit_rejects_stale_sandbox_before_side_effects() {
-        let (mut live_svm, _events_rx, geyser_rx) = SurfnetSvm::default();
-        let sandbox = live_svm.clone_for_bundle_sandbox();
-        let sandbox_slot = sandbox.svm.get_latest_absolute_slot();
-        live_svm
-            .confirm_current_block()
-            .expect("live slot should advance");
-        let live_slot = live_svm.get_latest_absolute_slot();
-        let (bundle_status_tx, _bundle_status_rx) = unbounded();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundle_commit_rejects_sandbox_after_live_write_without_slot_change() {
+        let (live_svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(live_svm);
+        let sandbox = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
+        let slot_before = locker.get_latest_absolute_slot();
 
-        let error = live_svm
-            .commit_sandbox(sandbox, bundle_status_tx)
+        // A cheatcode-style write lands while the bundle executes; the slot does not move.
+        let pubkey = Pubkey::new_unique();
+        let account = Account {
+            lamports: 42,
+            ..Default::default()
+        };
+        let written = account.clone();
+        locker
+            .with_svm_writer(move |svm| svm.set_account(&pubkey, written))
+            .expect("live write should succeed");
+        assert_eq!(locker.get_latest_absolute_slot(), slot_before);
+
+        let (bundle_status_tx, _bundle_status_rx) = unbounded();
+        let error = locker
+            .with_svm_writer(move |svm| svm.commit_sandbox(sandbox, bundle_status_tx))
             .expect_err("stale sandbox must not commit");
 
-        assert!(error.to_string().contains(&format!(
-            "Bundle sandbox slot {sandbox_slot} does not match live slot {live_slot}"
-        )));
-        assert!(live_svm.transactions_queued_for_confirmation.is_empty());
+        assert!(
+            error
+                .to_string()
+                .contains("does not match live state revision")
+        );
+        let live_account = locker
+            .with_svm_reader(|svm| svm.inner.get_account(&pubkey))
+            .expect("account lookup should succeed");
+        assert_eq!(live_account, Some(account));
+        locker.with_svm_reader(|svm| assert!(svm.transactions_queued_for_confirmation.is_empty()));
         assert!(
             geyser_rx
                 .try_iter()

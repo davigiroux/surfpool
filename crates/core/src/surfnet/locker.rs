@@ -242,7 +242,11 @@ impl SurfnetSvmLocker {
         let write_lock = self.0.clone();
         tokio::task::block_in_place(move || {
             let mut write_guard = write_lock.blocking_write();
-            writer(&mut write_guard)
+            // Bump after the closure so a writer can compare against the revision it
+            // observed (e.g. a bundle commit checking its sandbox is not stale).
+            let result = writer(&mut write_guard);
+            write_guard.bump_state_revision();
+            result
         })
     }
 }
@@ -2596,6 +2600,7 @@ impl SurfnetSvmLocker {
         }
 
         let mut svm_writer = self.0.write().await;
+        svm_writer.bump_state_revision();
         match svm_writer.send_transaction(transaction.clone(), false, sigverify) {
             Ok(transaction_metadata) => Self::handle_execution_success(
                 &mut svm_writer,
@@ -2818,6 +2823,7 @@ impl SurfnetSvmLocker {
         slot: Slot,
     ) -> SurfpoolResult<()> {
         let mut svm_writer = self.0.write().await;
+        svm_writer.bump_state_revision();
         svm_writer
             .materialize_overrides_for_slot(remote_ctx, slot)
             .await
@@ -3991,6 +3997,7 @@ impl SurfnetSvmLocker {
         // Acquire write lock once and do both operations atomically
         // This prevents lock contention and potential deadlocks from mixing blocking and async locks
         let mut svm_writer = self.0.write().await;
+        svm_writer.bump_state_revision();
         svm_writer.confirm_current_block()?;
         svm_writer.materialize_overrides(remote_ctx).await
     }

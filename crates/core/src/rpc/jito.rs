@@ -32,6 +32,9 @@ const MAX_BUNDLE_SIZE: usize = 5;
 /// Jito's documented limit. Larger batches are rejected with `invalid_params`.
 const MAX_BUNDLES_PER_QUERY: usize = 5;
 
+/// Times a bundle is re-executed when live state changes before its sandbox commits.
+const MAX_BUNDLE_COMMIT_ATTEMPTS: usize = 3;
+
 /// Jito-specific RPC methods for bundle submission
 #[rpc]
 pub trait Jito {
@@ -869,11 +872,67 @@ pub(crate) async fn process_bundle(
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     decoded_txs: Vec<VersionedTransaction>,
 ) -> std::result::Result<String, String> {
-    // -- Phase A: Sandbox execution ---------------------------------------------------------
     prefetch_bundle_accounts(svm_locker, remote_ctx, &decoded_txs)
         .await
         .map_err(|error| error.to_string())?;
 
+    // RPC handlers (e.g. cheatcodes) can write live state while the sandbox executes, since
+    // the live lock is not held across execution. A stale sandbox is never committed; the
+    // bundle is re-executed against a fresh snapshot instead.
+    let mut attempt = 1;
+    let bundle_signatures = loop {
+        let (sandbox, bundle_signatures) =
+            execute_bundle_in_sandbox(svm_locker, &decoded_txs).await?;
+        let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+        let committed = svm_locker
+            .with_svm_writer(move |live| {
+                if live.is_stale_bundle_sandbox(&sandbox) {
+                    return Ok(false);
+                }
+                live.commit_sandbox(sandbox, bundle_status_tx).map(|_| true)
+            })
+            .map_err(|e| {
+                format!("Jito bundle commit failed after successful sandbox execution: {e}")
+            })?;
+        if committed {
+            break bundle_signatures;
+        }
+        if attempt >= MAX_BUNDLE_COMMIT_ATTEMPTS {
+            return Err(format!(
+                "Jito bundle couldn't be committed: live state changed during execution {attempt} times"
+            ));
+        }
+        attempt += 1;
+    };
+
+    let concatenated_signatures = bundle_signatures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut hasher = Sha256::new();
+    hasher.update(concatenated_signatures.as_bytes());
+    let bundle_id = hex::encode(hasher.finalize());
+
+    svm_locker
+        .store_bundle(
+            bundle_id.clone(),
+            bundle_signatures.iter().map(ToString::to_string).collect(),
+        )
+        .map_err(|e| format!("failed to persist Jito bundle: {e}"))?;
+
+    Ok(bundle_id)
+}
+
+/// Runs every bundle transaction against a fresh sandbox cloned from live state.
+///
+/// Returns the executed sandbox, ready for
+/// [`SurfnetSvm::commit_sandbox`](crate::surfnet::svm::SurfnetSvm::commit_sandbox),
+/// and the bundle's signatures in order. Nothing is written to the live SVM.
+async fn execute_bundle_in_sandbox(
+    svm_locker: &SurfnetSvmLocker,
+    decoded_txs: &[VersionedTransaction],
+) -> std::result::Result<(BundleSandbox, Vec<Signature>), String> {
     let bundle_sandbox =
         svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
 
@@ -882,6 +941,7 @@ pub(crate) async fn process_bundle(
         geyser_rx,
         simnet_rx,
         confirmation_queue_base_len,
+        base_state_revision,
     } = bundle_sandbox;
     let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -934,41 +994,18 @@ pub(crate) async fn process_bundle(
         }
     }
 
-    // -- Phase B: Atomic commit -------------------------------------------------------------
     let sandbox_svm = Arc::try_unwrap(sandbox_locker.0)
         .map_err(|_| "Jito bundle sandbox remained shared after execution".to_string())?
         .into_inner();
-    let reassembled = BundleSandbox {
+    let sandbox = BundleSandbox {
         svm: sandbox_svm,
         geyser_rx,
         simnet_rx,
         confirmation_queue_base_len,
+        base_state_revision,
     };
-    let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
 
-    svm_locker
-        .with_svm_writer(move |original| original.commit_sandbox(reassembled, bundle_status_tx))
-        .map_err(|e| {
-            format!("Jito bundle commit failed after successful sandbox execution: {e}")
-        })?;
-
-    let concatenated_signatures = bundle_signatures
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut hasher = Sha256::new();
-    hasher.update(concatenated_signatures.as_bytes());
-    let bundle_id = hex::encode(hasher.finalize());
-
-    svm_locker
-        .store_bundle(
-            bundle_id.clone(),
-            bundle_signatures.iter().map(ToString::to_string).collect(),
-        )
-        .map_err(|e| format!("failed to persist Jito bundle: {e}"))?;
-
-    Ok(bundle_id)
+    Ok((sandbox, bundle_signatures))
 }
 
 /// Hydrates accounts needed by a bundle into the live SVM before snapshotting.
