@@ -516,12 +516,7 @@ pub async fn start_block_production_runloop(
                        }
                     }
                     SimnetCommand::ProcessBundle(_key, transactions, reply_tx) => {
-                        let result = rpc::jito::process_bundle(
-                            &svm_locker,
-                            &remote_client_with_commitment,
-                            transactions,
-                        )
-                        .await;
+                        let result = rpc::jito::process_bundle(&svm_locker, transactions).await;
                         if result.is_ok() && block_production_mode.eq(&BlockProductionMode::Transaction) {
                             do_produce_block = true;
                         }

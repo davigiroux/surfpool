@@ -22,7 +22,11 @@ use super::{RunloopContext, utils::decode_and_deserialize};
 use crate::{
     error::SurfpoolResult,
     rpc::full::SurfpoolFullRpc,
-    surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::BundleSandbox},
+    surfnet::{
+        locker::SurfnetSvmLocker,
+        remote::{SomeRemoteCtx, SurfnetRemoteClient},
+        svm::BundleSandbox,
+    },
 };
 
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
@@ -309,6 +313,16 @@ impl Jito for SurfpoolJitoRpc {
                 })?;
                 decoded_txs.push(tx);
             }
+
+            // Hydrate remote accounts before entering the serialized execution lane, so a
+            // slow datasource delays only this request rather than stalling block
+            // production and every other runloop command behind it.
+            let remote_ctx = ctx
+                .remote_rpc_client
+                .get_remote_ctx(CommitmentConfig::confirmed());
+            prefetch_bundle_accounts(&ctx.svm_locker, &remote_ctx, &decoded_txs)
+                .await
+                .map_err(|error| Error::invalid_params(error.to_string()))?;
 
             // Bundles must use the same serialized execution lane as ordinary transactions.
             // The runloop owns the snapshot -> sandbox execution -> commit sequence, so a
@@ -858,21 +872,17 @@ impl Jito for SurfpoolJitoRpc {
 /// Executes decoded Jito bundle transactions atomically.
 ///
 /// Transactions run sequentially against an isolated sandbox. Required remote
-/// accounts are prefetched into the live SVM in batches before the sandbox is
-/// created. If every transaction succeeds, the sandbox state and buffered
-/// notifications are committed to the live SVM and the Jito bundle ID is
-/// returned. On failure, execution effects are discarded while prefetched
+/// accounts are expected to have been prefetched into the live SVM by
+/// [`prefetch_bundle_accounts`] before the bundle is enqueued; execution makes
+/// no remote requests. If every transaction succeeds, the sandbox state and
+/// buffered notifications are committed to the live SVM and the Jito bundle ID
+/// is returned. On failure, execution effects are discarded while prefetched
 /// accounts remain cached.
 pub(crate) async fn process_bundle(
     svm_locker: &SurfnetSvmLocker,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     decoded_txs: Vec<VersionedTransaction>,
 ) -> std::result::Result<String, String> {
     // -- Phase A: Sandbox execution ---------------------------------------------------------
-    prefetch_bundle_accounts(svm_locker, remote_ctx, &decoded_txs)
-        .await
-        .map_err(|error| error.to_string())?;
-
     let bundle_sandbox =
         svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
 
@@ -883,8 +893,9 @@ pub(crate) async fn process_bundle(
     } = bundle_sandbox;
     let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
-    // Prefetching above is the only remote interaction. Transactions execute
-    // against the hydrated sandbox, preventing per-transaction RPC requests.
+    // Prefetching in `send_bundle` is the only remote interaction. Transactions
+    // execute against the hydrated sandbox, preventing per-transaction RPC
+    // requests from inside the runloop.
     let remote_ctx = &None;
     let skip_preflight = true;
     let sigverify = true;
@@ -968,7 +979,8 @@ pub(crate) async fn process_bundle(
     Ok(bundle_id)
 }
 
-/// Hydrates accounts needed by a bundle into the live SVM before snapshotting.
+/// Hydrates accounts needed by a bundle into the live SVM. Runs in the RPC
+/// handler, outside the runloop, before the bundle is enqueued for execution.
 ///
 /// Static account keys and lookup-table accounts are fetched together. Once
 /// lookup tables are available locally, their loaded addresses are resolved
@@ -1285,11 +1297,8 @@ mod tests {
                 .expect("bundle command test runtime should start");
             while let Ok(command) = commands_rx.recv() {
                 if let SimnetCommand::ProcessBundle(_, transactions, reply_tx) = command {
-                    let _ = reply_tx.send(runtime.block_on(process_bundle(
-                        &svm_locker,
-                        &None,
-                        transactions,
-                    )));
+                    let _ =
+                        reply_tx.send(runtime.block_on(process_bundle(&svm_locker, transactions)));
                 }
             }
         });
@@ -1393,6 +1402,135 @@ mod tests {
                 .expect("sendBundle task should not panic")
                 .expect("runloop success should become an RPC success"),
             "bundle-id-from-runloop"
+        );
+    }
+
+    /// A datasource that records `getMultipleAccounts` requests and holds each
+    /// answer until released, reporting every requested pubkey as missing.
+    struct GatedDatasource {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl solana_rpc_client::rpc_sender::RpcSender for GatedDatasource {
+        async fn send(
+            &self,
+            _request: solana_client::rpc_request::RpcRequest,
+            params: serde_json::Value,
+        ) -> solana_rpc_client_api::client_error::Result<serde_json::Value> {
+            let requested = params[0].as_array().map_or(0, Vec::len);
+            self.requests
+                .lock()
+                .expect("request recorder mutex should not be poisoned")
+                .push(params);
+            self.release
+                .acquire()
+                .await
+                .expect("release semaphore should stay open")
+                .forget();
+            Ok(serde_json::json!({
+                "context": { "slot": 1 },
+                "value": vec![serde_json::Value::Null; requested],
+            }))
+        }
+
+        fn get_transport_stats(&self) -> solana_rpc_client::rpc_sender::RpcTransportStats {
+            Default::default()
+        }
+
+        fn url(&self) -> String {
+            "http://gated.example".to_string()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_bundle_prefetches_accounts_before_entering_the_runloop() {
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        let mut setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, commands_tx);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+            client: Arc::new(
+                solana_client::nonblocking::rpc_client::RpcClient::new_sender(
+                    GatedDatasource {
+                        requests: Arc::clone(&requests),
+                        release: Arc::clone(&release),
+                    },
+                    Default::default(),
+                ),
+            ),
+        });
+
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+        let encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+
+        let context = setup.context.clone();
+        let rpc_task = tokio::spawn(async move {
+            SurfpoolJitoRpc
+                .send_bundle(Some(context), vec![encoded], None)
+                .await
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while requests.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sendBundle should query the datasource"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // The runloop is free while the datasource is slow: nothing has been
+        // enqueued yet.
+        assert!(
+            commands_rx.try_recv().is_err(),
+            "ProcessBundle must not be enqueued while the prefetch is in flight"
+        );
+        {
+            let requests = requests.lock().unwrap();
+            let requested: Vec<&str> = requests[0][0]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|pubkey| pubkey.as_str())
+                .collect();
+            assert!(requested.contains(&payer.pubkey().to_string().as_str()));
+            assert!(requested.contains(&recipient.to_string().as_str()));
+        }
+
+        release.add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        let command = tokio::task::block_in_place(|| {
+            commands_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("sendBundle should enqueue the bundle once prefetch completes")
+        });
+        let SimnetCommand::ProcessBundle(_, _, reply_tx) = command else {
+            panic!("sendBundle must enqueue ProcessBundle");
+        };
+        reply_tx
+            .send(Ok("bundle-id".to_string()))
+            .expect("sendBundle must still be waiting for the runloop reply");
+        assert_eq!(
+            rpc_task
+                .await
+                .expect("sendBundle task should not panic")
+                .expect("runloop success should become an RPC success"),
+            "bundle-id"
         );
     }
 
