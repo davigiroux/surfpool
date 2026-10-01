@@ -103,26 +103,34 @@ use crate::{
     },
 };
 
+/// Simulated time between garbage collections of the lite SVM cache.
+pub const GARBAGE_COLLECTION_INTERVAL_MS: u64 = 60 * 60 * 1000;
+
+/// Simulated time between checkpoints of the latest slot to storage.
+pub const CHECKPOINT_INTERVAL_MS: u64 = 60 * 1000;
+
 lazy_static::lazy_static! {
-    /// Interval (in slots) at which to perform garbage collection on the lite SVM cache.
-    /// About 1 hour at standard 400ms slot time.
-    /// Configurable via SURFPOOL_GARBAGE_COLLECTION_INTERVAL_SLOTS env var.
-    pub static ref GARBAGE_COLLECTION_INTERVAL_SLOTS: u64 = {
+    /// Overrides the garbage collection interval with a fixed number of slots.
+    /// Set via SURFPOOL_GARBAGE_COLLECTION_INTERVAL_SLOTS env var.
+    pub static ref GARBAGE_COLLECTION_INTERVAL_SLOTS_OVERRIDE: Option<u64> =
         std::env::var("SURFPOOL_GARBAGE_COLLECTION_INTERVAL_SLOTS")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(9_000)
-    };
+            .and_then(|s| s.parse().ok());
 
-    /// Interval (in slots) at which to checkpoint the latest slot to storage.
-    /// About 1 minute at standard 400ms slot time (60000ms / 400ms = 150 slots).
-    /// Configurable via SURFPOOL_CHECKPOINT_INTERVAL_SLOTS env var.
-    pub static ref CHECKPOINT_INTERVAL_SLOTS: u64 = {
+    /// Overrides the checkpoint interval with a fixed number of slots.
+    /// Set via SURFPOOL_CHECKPOINT_INTERVAL_SLOTS env var.
+    pub static ref CHECKPOINT_INTERVAL_SLOTS_OVERRIDE: Option<u64> =
         std::env::var("SURFPOOL_CHECKPOINT_INTERVAL_SLOTS")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(150)
-    };
+            .and_then(|s| s.parse().ok());
+}
+
+/// Converts a simulated-time interval into slots at the given slot time, unless a slot
+/// count override is set. Never returns 0.
+fn interval_in_slots(override_slots: Option<u64>, interval_ms: u64, slot_time: u64) -> u64 {
+    override_slots
+        .unwrap_or_else(|| interval_ms / slot_time.max(1))
+        .max(1)
 }
 
 /// Determines how an account result may change the SVM.
@@ -1542,6 +1550,24 @@ impl SurfnetSvm {
         self.genesis_updated_at + (slots_since_genesis * self.slot_time)
     }
 
+    /// Slots between garbage collections of the lite SVM cache at the current slot time.
+    pub fn garbage_collection_interval_slots(&self) -> u64 {
+        interval_in_slots(
+            *GARBAGE_COLLECTION_INTERVAL_SLOTS_OVERRIDE,
+            GARBAGE_COLLECTION_INTERVAL_MS,
+            self.slot_time,
+        )
+    }
+
+    /// Slots between checkpoints of the latest slot at the current slot time.
+    pub fn checkpoint_interval_slots(&self) -> u64 {
+        interval_in_slots(
+            *CHECKPOINT_INTERVAL_SLOTS_OVERRIDE,
+            CHECKPOINT_INTERVAL_MS,
+            self.slot_time,
+        )
+    }
+
     /// Checks if a slot is within the valid range for sparse block storage.
     /// A slot is valid if it's between genesis_slot (inclusive) and latest_slot (inclusive).
     ///
@@ -2733,7 +2759,7 @@ impl SurfnetSvm {
         // sample. See https://solana.com/docs/rpc/websocket/slotsupdatessubscribe
         let slots_update_ts: u64 = Utc::now().timestamp_millis().max(0) as u64;
         let previous_chain_tip = self.chain_tip.clone();
-        if slot % *GARBAGE_COLLECTION_INTERVAL_SLOTS == 0 {
+        if slot.is_multiple_of(self.garbage_collection_interval_slots()) {
             debug!("Clearing liteSVM cache at slot {}", slot);
             self.inner.garbage_collect(self.feature_set.clone());
         }
@@ -2761,9 +2787,9 @@ impl SurfnetSvm {
             )?;
         }
 
-        // Checkpoint the latest slot periodically (~every 150 slots / 1 minute at standard slot time)
+        // Checkpoint the latest slot periodically (~every minute of simulated time)
         // This allows recovery after restart without storing every empty block
-        if slot.saturating_sub(self.last_checkpoint_slot) >= *CHECKPOINT_INTERVAL_SLOTS {
+        if slot.saturating_sub(self.last_checkpoint_slot) >= self.checkpoint_interval_slots() {
             self.slot_checkpoint
                 .store("latest_slot".to_string(), slot)?;
             self.last_checkpoint_slot = slot;
@@ -5804,11 +5830,12 @@ mod tests {
             surfnet_id,
             ..SurfnetSvmConfig::default()
         };
-        let target_slot = (*CHECKPOINT_INTERVAL_SLOTS).max(FINALIZATION_SLOT_THRESHOLD);
-
         let checkpoint_slot = {
             let (mut svm, _events_rx, _geyser_rx) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            let target_slot = svm
+                .checkpoint_interval_slots()
+                .max(FINALIZATION_SLOT_THRESHOLD);
             while svm.get_latest_absolute_slot() <= target_slot {
                 svm.confirm_current_block().unwrap();
             }
@@ -5861,13 +5888,13 @@ mod tests {
             surfnet_id,
             ..SurfnetSvmConfig::default()
         };
-        let block_slot = (*CHECKPOINT_INTERVAL_SLOTS)
-            .max(FINALIZATION_SLOT_THRESHOLD)
-            .saturating_add(7);
-
-        {
+        let block_slot = {
             let (mut svm, _events_rx, _geyser_rx) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            let block_slot = svm
+                .checkpoint_interval_slots()
+                .max(FINALIZATION_SLOT_THRESHOLD)
+                .saturating_add(7);
             svm.blocks
                 .store(
                     block_slot,
@@ -5888,7 +5915,8 @@ mod tests {
                     .is_none()
             );
             svm.shutdown();
-        }
+            block_slot
+        };
 
         let (svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
@@ -8037,7 +8065,7 @@ mod tests {
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     fn garbage_collection_keeps_the_epoch_schedule(test_type: TestType) {
         let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-        let gc_slot = *GARBAGE_COLLECTION_INTERVAL_SLOTS;
+        let gc_slot = svm.garbage_collection_interval_slots();
         svm.latest_epoch_info.absolute_slot = gc_slot;
         svm.latest_epoch_info.slot_index = gc_slot;
 
@@ -8052,6 +8080,52 @@ mod tests {
                 info.slot_index
             ),
             (EpochSchedule::without_warmup(), gc_slot + 1, 0, gc_slot + 1)
+        );
+    }
+
+    #[test_case(1, 3_600_000, 60_000; "1ms slots")]
+    #[test_case(DEFAULT_SLOT_TIME_MS, 9_000, 150; "default slots")]
+    #[test_case(4_000, 900, 15; "4s slots")]
+    fn maintenance_intervals_follow_slot_time(
+        slot_time: u64,
+        gc_slots: u64,
+        checkpoint_slots: u64,
+    ) {
+        assert_eq!(
+            interval_in_slots(None, GARBAGE_COLLECTION_INTERVAL_MS, slot_time),
+            gc_slots
+        );
+        assert_eq!(
+            interval_in_slots(None, CHECKPOINT_INTERVAL_MS, slot_time),
+            checkpoint_slots
+        );
+    }
+
+    #[test]
+    fn maintenance_interval_override_and_bounds() {
+        assert_eq!(interval_in_slots(Some(42), CHECKPOINT_INTERVAL_MS, 1), 42);
+        assert_eq!(interval_in_slots(Some(0), CHECKPOINT_INTERVAL_MS, 1), 1);
+        assert_eq!(interval_in_slots(None, CHECKPOINT_INTERVAL_MS, u64::MAX), 1);
+        assert_eq!(
+            interval_in_slots(None, CHECKPOINT_INTERVAL_MS, 0),
+            CHECKPOINT_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn maintenance_intervals_track_slot_time_updates() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.slot_time = 4_000;
+        assert_eq!(
+            svm.checkpoint_interval_slots(),
+            CHECKPOINT_INTERVAL_SLOTS_OVERRIDE.unwrap_or(15)
+        );
+        svm.slot_time = 1;
+        assert_eq!(
+            svm.garbage_collection_interval_slots(),
+            GARBAGE_COLLECTION_INTERVAL_SLOTS_OVERRIDE
+                .unwrap_or(3_600_000)
+                .max(1)
         );
     }
 }

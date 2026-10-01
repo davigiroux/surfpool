@@ -4831,8 +4831,13 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
 #[test]
 fn time_travel_keeps_the_clock_on_the_absolute_slot() {
     let rpc_server = SurfnetCheatcodesRpc::empty();
-    let simnet = boot_simnet(BlockProductionMode::Manual, Some(400), TestType::no_db())
-        .expect("the simnet should boot");
+    let slot_time = 400;
+    let simnet = boot_simnet(
+        BlockProductionMode::Manual,
+        Some(slot_time),
+        TestType::no_db(),
+    )
+    .expect("the simnet should boot");
     let svm_locker = simnet.locker.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
     let runloop_context = RunloopContext {
@@ -4855,12 +4860,12 @@ fn time_travel_keeps_the_clock_on_the_absolute_slot() {
         })
     };
 
-    let one_day_in_slots = 24 * 60 * 60 * 1000 / 400;
+    let one_day_in_slots = 24 * 60 * 60 * 1000 / slot_time;
     for travel in 0..3 {
         let (_, before, schedule, updated_at) = state();
         let (config, expected_slot) = match travel {
             0 => (
-                TimeTravelConfig::AbsoluteTimestamp(updated_at + one_day_in_slots * 400),
+                TimeTravelConfig::AbsoluteTimestamp(updated_at + one_day_in_slots * slot_time),
                 before.absolute_slot + one_day_in_slots,
             ),
             1 => {
