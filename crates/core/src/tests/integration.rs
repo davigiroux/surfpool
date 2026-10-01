@@ -4580,9 +4580,10 @@ fn boot_simnet(
     let bind_host = "127.0.0.1";
     let bind_port = get_free_port().map_err(RunloopError::NoFreePort)?;
     let ws_port = get_free_port().map_err(RunloopError::NoFreePort)?;
+    let slot_time = slot_time.unwrap_or(DEFAULT_SLOT_TIME_MS);
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
-            slot_time: slot_time.unwrap_or(DEFAULT_SLOT_TIME_MS),
+            slot_time,
             block_production_mode,
             offline_mode: true,
             remote_rpc_url: None,
@@ -4600,7 +4601,9 @@ fn boot_simnet(
         ..SurfpoolConfig::default()
     };
 
-    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (mut surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    // The runloop and the SVM must agree on slot time, as they do when the CLI builds both.
+    surfnet_svm.slot_time = slot_time;
     let (simnet_commands_tx, simnet_commands_rx) = unbounded();
 
     let svm_locker = SurfnetSvmLocker::new(surfnet_svm);

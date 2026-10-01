@@ -21,7 +21,7 @@ templateId: string,
 values: Record<string, unknown>, 
 /**
  * Relative slot when this override should be applied (1 = one slot after registration;
- * a slot lasts the surfnet's configured slot time, 400ms by default)
+ * a slot lasts the surfnet's configured slot time, 250ms by default)
  */
 scenarioRelativeSlot: number | bigint, 
 /**

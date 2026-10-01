@@ -8084,7 +8084,7 @@ mod tests {
     }
 
     #[test_case(1, 3_600_000, 60_000; "1ms slots")]
-    #[test_case(DEFAULT_SLOT_TIME_MS, 9_000, 150; "default slots")]
+    #[test_case(DEFAULT_SLOT_TIME_MS, 14_400, 240; "default slots")]
     #[test_case(4_000, 900, 15; "4s slots")]
     fn maintenance_intervals_follow_slot_time(
         slot_time: u64,
